@@ -1,0 +1,2742 @@
+openapi: 3.1.0
+
+info:
+  title: Archipelago API
+  version: 0.1.0
+  summary: Organization, people, payroll and contractor payments in one API.
+  description: |
+    Archipelago is an HR platform. Use the API to:
+
+    - **Manage your organization**: businesses, teams and the individuals who work in them.
+    - **Pay your people**: compensation, bonuses, expenses and reimbursements, paid straight to their bank accounts.
+    - **Let contractors get paid on demand**: independent contractors charge their own customers by card or
+      bank account.
+
+    ## Paying people
+
+    1. Add a funding **bank account** to the business and a payout bank account to each individual.
+    2. Give each individual a **compensation**. Archipelago creates a payable for every pay period.
+    3. Approve **bonuses** and **expenses**. Approved bonuses and **reimbursements** become payables too.
+    4. On the pay date, scheduled **payables** are paid out to each individual's bank account.
+       Track them with the `payable.paid` and `payable.failed` webhooks.
+
+    ## Contractor payments
+
+    1. Create an individual with `employment_type: contractor` and give them a bank account.
+    2. Create their **payment account**. Once it's verified and `enabled`, they can accept payments.
+    3. Create a **checkout** and share its `checkout_url` with the customer.
+    4. When the customer pays, a **payment** is recorded and the funds settle to the contractor's bank account.
+
+    ## Authentication
+
+    Send an access token in the `Authorization` header of every request:
+
+    ```
+    Authorization: Bearer <access_token>
+    ```
+
+    Tokens are issued per API client through the OAuth 2.0 client-credentials flow and are scoped to your
+    organization.
+
+    <!-- ReDoc-Inject: <security-definitions> -->
+
+    ## Pagination
+
+    List endpoints are cursor-paginated. Pass `limit` (1-100, default 25), then pass `page_info.end_cursor`
+    as `after_cursor` to get the next page, or `page_info.start_cursor` as `before_cursor` to get the previous one.
+
+    ## Amounts
+
+    Money is always an integer in the currency's minor unit, next to a lowercase ISO currency code:
+    `"amount": 150000, "currency": "usd"` is $1,500.00.
+
+    ## Idempotency
+
+    Endpoints that create money movement (bonuses, reimbursements, checkouts and refunds) require an
+    `Idempotency-Key` header. Retrying a request with the same key returns the original response instead of
+    creating a duplicate. Keys expire after 24 hours.
+
+    ## Errors
+
+    Errors use standard HTTP status codes and the same body shape:
+
+    ```json
+    {
+      "error": {
+        "code": "validation_error",
+        "message": "The request body is invalid.",
+        "details": [{ "field": "email", "message": "is not a valid email address" }]
+      }
+    }
+    ```
+
+    | Status | Meaning |
+    |---|---|
+    | 401 | Missing or invalid access token. |
+    | 404 | The resource doesn't exist or isn't visible to your API client. |
+    | 409 | The action isn't allowed in the resource's current state, such as approving a bonus that was already paid. |
+    | 422 | The request body failed validation. |
+
+    ## Webhooks
+
+    Archipelago sends events to the webhook URL configured for your API client. Each request has an
+    `Archipelago-Signature` header in the form `t=<unix timestamp>,v1=<signature>`, where the signature is the
+    hex HMAC-SHA256 of `<timestamp>.<raw request body>` keyed with your webhook secret. Respond with any `2xx`
+    status. Failed deliveries are retried with exponential backoff.
+
+servers:
+  - url: https://api.archipelago.example/v1
+    description: Production
+  - url: https://sandbox.api.archipelago.example/v1
+    description: Sandbox (test mode, no real money moves)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Businesses
+    description: |
+      A business is an employer: the legal entity whose people you manage and that funds their pay.
+  - name: Teams
+    description: |
+      Groups of individuals within a business. Teams can be nested with `parent_team_id`, and each
+      membership has a role (`member` or `lead`).
+  - name: Individuals
+    description: |
+      The people who work for a business: full-time and part-time employees, and independent contractors.
+  - name: Bank Accounts
+    description: |
+      Bank accounts that fund payouts (owned by a business) or receive them (owned by an individual).
+      Account and routing numbers are write-only; responses show only the last four digits.
+  - name: Compensation
+    description: |
+      Recurring pay for an individual: a salary, an hourly rate, or a fixed amount per pay period.
+      Archipelago turns active compensation into a payable for every pay period.
+  - name: Bonuses
+    description: |
+      One-off payments such as signing, performance or referral bonuses. A bonus becomes a payable once
+      it's approved.
+  - name: Expenses
+    description: |
+      Out-of-pocket costs an individual submits for review. Approved expenses are paid back with a reimbursement.
+  - name: Reimbursements
+    description: |
+      Pays an individual back for one or more approved expenses as a single payable.
+  - name: Payables
+    description: |
+      Every amount owed to an individual, from compensation, bonuses and reimbursements. Payables are
+      created automatically; use these endpoints to track, cancel or retry them.
+  - name: Payment Accounts
+    description: |
+      Lets an independent contractor accept payments from their own customers. A payment account has to be
+      verified and `enabled` before the contractor can create checkouts.
+  - name: Checkouts
+    description: |
+      A request for a customer to pay a contractor. Share the `checkout_url` and the customer pays by card
+      or bank account.
+  - name: Payments
+    description: |
+      Payments customers made through checkouts, and their refunds. Funds settle to the contractor's
+      payment account, minus any platform fee.
+  - name: Webhooks
+    description: |
+      Events Archipelago sends to your webhook URL. See [Webhooks](#section/Webhooks) for how to verify them.
+
+x-tagGroups:
+  - name: Organization
+    tags: [Businesses, Teams, Individuals]
+  - name: Finance
+    tags: [Bank Accounts, Compensation, Bonuses, Expenses, Reimbursements, Payables]
+  - name: Contractor Payments
+    tags: [Payment Accounts, Checkouts, Payments]
+  - name: Events
+    tags: [Webhooks]
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Organization
+  # ---------------------------------------------------------------------------
+  /businesses:
+    get:
+      tags: [Businesses]
+      operationId: listBusinesses
+      summary: List businesses
+      parameters:
+        - $ref: '#/components/parameters/IncludeArchived'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of businesses.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BusinessList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Businesses]
+      operationId: createBusiness
+      summary: Create a business
+      description: Creates a business.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BusinessCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Business' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /businesses/{business_id}:
+    parameters:
+      - $ref: '#/components/parameters/BusinessId'
+    get:
+      tags: [Businesses]
+      operationId: getBusiness
+      summary: Retrieve a business
+      responses:
+        '200': { $ref: '#/components/responses/Business' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Businesses]
+      operationId: updateBusiness
+      summary: Update a business
+      description: Updates the fields you send. Omitted fields are left unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BusinessFields' }
+      responses:
+        '200': { $ref: '#/components/responses/Business' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Businesses]
+      operationId: archiveBusiness
+      summary: Archive a business
+      description: |
+        Archives the business. Its records are kept for reporting, but it can't be changed or pay anyone.
+        Fails with `409` while the business has scheduled or processing payables.
+      responses:
+        '204':
+          description: The business was archived.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /teams:
+    get:
+      tags: [Teams]
+      operationId: listTeams
+      summary: List teams
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - name: parent_team_id
+          in: query
+          description: Only return direct sub-teams of this team.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of teams.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TeamList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Teams]
+      operationId: createTeam
+      summary: Create a team
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TeamCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Team' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /teams/{team_id}:
+    parameters:
+      - $ref: '#/components/parameters/TeamId'
+    get:
+      tags: [Teams]
+      operationId: getTeam
+      summary: Retrieve a team
+      responses:
+        '200': { $ref: '#/components/responses/Team' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Teams]
+      operationId: updateTeam
+      summary: Update a team
+      description: Updates the fields you send. Omitted fields are left unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TeamFields' }
+      responses:
+        '200': { $ref: '#/components/responses/Team' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Teams]
+      operationId: deleteTeam
+      summary: Delete a team
+      description: |
+        Deletes the team and its memberships. The individuals are not affected. Sub-teams move up to the
+        deleted team's parent.
+      responses:
+        '204':
+          description: The team was deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /teams/{team_id}/members:
+    parameters:
+      - $ref: '#/components/parameters/TeamId'
+    get:
+      tags: [Teams]
+      operationId: listTeamMembers
+      summary: List team members
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of team members.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TeamMemberList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Teams]
+      operationId: addTeamMember
+      summary: Add a team member
+      description: Adds an individual from the same business to the team. Fails with `409` if they're already a member.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TeamMemberCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/TeamMember' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /teams/{team_id}/members/{individual_id}:
+    parameters:
+      - $ref: '#/components/parameters/TeamId'
+      - $ref: '#/components/parameters/IndividualId'
+    delete:
+      tags: [Teams]
+      operationId: removeTeamMember
+      summary: Remove a team member
+      responses:
+        '204':
+          description: The individual was removed from the team.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /individuals:
+    get:
+      tags: [Individuals]
+      operationId: listIndividuals
+      summary: List individuals
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - name: team_id
+          in: query
+          description: Only return members of this team.
+          schema:
+            type: string
+        - name: employment_type
+          in: query
+          schema:
+            type: string
+            enum: [full_time, part_time, contractor]
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [onboarding, active, on_leave, terminated]
+        - $ref: '#/components/parameters/IncludeArchived'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of individuals.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IndividualList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Individuals]
+      operationId: createIndividual
+      summary: Create an individual
+      description: |
+        Creates an individual in a business. To put them on a team, use
+        [Add a team member](#operation/addTeamMember).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IndividualCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Individual' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /individuals/{individual_id}:
+    parameters:
+      - $ref: '#/components/parameters/IndividualId'
+    get:
+      tags: [Individuals]
+      operationId: getIndividual
+      summary: Retrieve an individual
+      responses:
+        '200': { $ref: '#/components/responses/Individual' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Individuals]
+      operationId: updateIndividual
+      summary: Update an individual
+      description: |
+        Updates the fields you send. Omitted fields are left unchanged.
+        To offboard someone, set `status` to `terminated` and `end_date` to their last working day.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IndividualFields' }
+      responses:
+        '200': { $ref: '#/components/responses/Individual' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Individuals]
+      operationId: archiveIndividual
+      summary: Archive an individual
+      description: |
+        Archives the individual. Their compensation, payables and expenses are kept for reporting.
+        Active compensation ends, scheduled payables are canceled, and they're removed from all teams.
+        Fails with `409` while they have processing payables.
+      responses:
+        '204':
+          description: The individual was archived.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---------------------------------------------------------------------------
+  # Finance
+  # ---------------------------------------------------------------------------
+  /bank_accounts:
+    get:
+      tags: [Bank Accounts]
+      operationId: listBankAccounts
+      summary: List bank accounts
+      parameters:
+        - name: owner_type
+          in: query
+          schema:
+            type: string
+            enum: [business, individual]
+        - name: owner_id
+          in: query
+          description: Only return bank accounts of this business or individual.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of bank accounts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BankAccountList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Bank Accounts]
+      operationId: createBankAccount
+      summary: Add a bank account
+      description: Adds a bank account for a business or an individual.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BankAccountCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/BankAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /bank_accounts/{bank_account_id}:
+    parameters:
+      - $ref: '#/components/parameters/BankAccountId'
+    get:
+      tags: [Bank Accounts]
+      operationId: getBankAccount
+      summary: Retrieve a bank account
+      responses:
+        '200': { $ref: '#/components/responses/BankAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Bank Accounts]
+      operationId: deleteBankAccount
+      summary: Remove a bank account
+      description: |
+        Removes the bank account. Fails with `409` if it's the default account of an owner with scheduled
+        payables, or the settlement account of a contractor's payment account.
+      responses:
+        '204':
+          description: The bank account was removed.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /compensations:
+    get:
+      tags: [Compensation]
+      operationId: listCompensations
+      summary: List compensation
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - $ref: '#/components/parameters/IndividualIdQuery'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [scheduled, active, ended]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of compensation records.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompensationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Compensation]
+      operationId: createCompensation
+      summary: Create compensation
+      description: |
+        Sets an individual's pay. From `effective_date`, Archipelago creates a payable for every pay period.
+        If the individual already has compensation, it ends the day before the new `effective_date`, so
+        creating a new record is how you give someone a raise and keep their pay history.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompensationCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Compensation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /compensations/{compensation_id}:
+    parameters:
+      - $ref: '#/components/parameters/CompensationId'
+    get:
+      tags: [Compensation]
+      operationId: getCompensation
+      summary: Retrieve compensation
+      responses:
+        '200': { $ref: '#/components/responses/Compensation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Compensation]
+      operationId: updateCompensation
+      summary: Update compensation
+      description: |
+        Updates the fields you send. Changes apply from the next pay period that hasn't been paid.
+        Once compensation is `active`, only `end_date` can change; create a new compensation for a raise.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompensationFields' }
+      responses:
+        '200': { $ref: '#/components/responses/Compensation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /bonuses:
+    get:
+      tags: [Bonuses]
+      operationId: listBonuses
+      summary: List bonuses
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - $ref: '#/components/parameters/IndividualIdQuery'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending_approval, approved, paid, canceled]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of bonuses.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BonusList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Bonuses]
+      operationId: createBonus
+      summary: Create a bonus
+      description: Creates a bonus in `pending_approval`. Nothing is paid until it's approved.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BonusCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Bonus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /bonuses/{bonus_id}:
+    parameters:
+      - $ref: '#/components/parameters/BonusId'
+    get:
+      tags: [Bonuses]
+      operationId: getBonus
+      summary: Retrieve a bonus
+      responses:
+        '200': { $ref: '#/components/responses/Bonus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /bonuses/{bonus_id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/BonusId'
+    post:
+      tags: [Bonuses]
+      operationId: approveBonus
+      summary: Approve a bonus
+      description: Approves a `pending_approval` bonus and creates a payable for its `pay_date`.
+      responses:
+        '200': { $ref: '#/components/responses/Bonus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /bonuses/{bonus_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/BonusId'
+    post:
+      tags: [Bonuses]
+      operationId: cancelBonus
+      summary: Cancel a bonus
+      description: Cancels a bonus that hasn't started processing. Its payable, if any, is canceled too.
+      responses:
+        '200': { $ref: '#/components/responses/Bonus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /expenses:
+    get:
+      tags: [Expenses]
+      operationId: listExpenses
+      summary: List expenses
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - $ref: '#/components/parameters/IndividualIdQuery'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [submitted, approved, rejected, reimbursed]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of expenses.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExpenseList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Expenses]
+      operationId: createExpense
+      summary: Submit an expense
+      description: Submits an expense for review. It starts in `submitted`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExpenseCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /expenses/{expense_id}:
+    parameters:
+      - $ref: '#/components/parameters/ExpenseId'
+    get:
+      tags: [Expenses]
+      operationId: getExpense
+      summary: Retrieve an expense
+      responses:
+        '200': { $ref: '#/components/responses/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Expenses]
+      operationId: updateExpense
+      summary: Update an expense
+      description: Updates the fields you send. Only `submitted` expenses can be changed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExpenseFields' }
+      responses:
+        '200': { $ref: '#/components/responses/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /expenses/{expense_id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/ExpenseId'
+    post:
+      tags: [Expenses]
+      operationId: approveExpense
+      summary: Approve an expense
+      description: Approves a `submitted` expense so it can be reimbursed.
+      responses:
+        '200': { $ref: '#/components/responses/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /expenses/{expense_id}/reject:
+    parameters:
+      - $ref: '#/components/parameters/ExpenseId'
+    post:
+      tags: [Expenses]
+      operationId: rejectExpense
+      summary: Reject an expense
+      description: Rejects a `submitted` expense. The reason is shown to the individual.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExpenseRejection' }
+      responses:
+        '200': { $ref: '#/components/responses/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /reimbursements:
+    get:
+      tags: [Reimbursements]
+      operationId: listReimbursements
+      summary: List reimbursements
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - $ref: '#/components/parameters/IndividualIdQuery'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [scheduled, processing, paid, failed, canceled]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of reimbursements.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReimbursementList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Reimbursements]
+      operationId: createReimbursement
+      summary: Create a reimbursement
+      description: |
+        Pays an individual back for one or more of their approved expenses. Creates one payable for the
+        total. The expenses move to `reimbursed` once the payable is paid.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReimbursementCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Reimbursement' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /reimbursements/{reimbursement_id}:
+    parameters:
+      - $ref: '#/components/parameters/ReimbursementId'
+    get:
+      tags: [Reimbursements]
+      operationId: getReimbursement
+      summary: Retrieve a reimbursement
+      responses:
+        '200': { $ref: '#/components/responses/Reimbursement' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /reimbursements/{reimbursement_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/ReimbursementId'
+    post:
+      tags: [Reimbursements]
+      operationId: cancelReimbursement
+      summary: Cancel a reimbursement
+      description: |
+        Cancels a `scheduled` reimbursement and its payable. The expenses go back to `approved` and can be
+        reimbursed again.
+      responses:
+        '200': { $ref: '#/components/responses/Reimbursement' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /payables:
+    get:
+      tags: [Payables]
+      operationId: listPayables
+      summary: List payables
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - $ref: '#/components/parameters/IndividualIdQuery'
+        - name: source_type
+          in: query
+          schema:
+            type: string
+            enum: [compensation, bonus, reimbursement]
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [scheduled, processing, paid, failed, canceled]
+        - name: pay_date_from
+          in: query
+          description: Only return payables with a `pay_date` on or after this date.
+          schema:
+            type: string
+            format: date
+        - name: pay_date_to
+          in: query
+          description: Only return payables with a `pay_date` on or before this date.
+          schema:
+            type: string
+            format: date
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of payables.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayableList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /payables/{payable_id}:
+    parameters:
+      - $ref: '#/components/parameters/PayableId'
+    get:
+      tags: [Payables]
+      operationId: getPayable
+      summary: Retrieve a payable
+      responses:
+        '200': { $ref: '#/components/responses/Payable' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /payables/{payable_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/PayableId'
+    post:
+      tags: [Payables]
+      operationId: cancelPayable
+      summary: Cancel a payable
+      description: |
+        Cancels a `scheduled` payable. Canceling a compensation payable skips that pay period. Canceling a
+        bonus or reimbursement payable also cancels the bonus or reimbursement.
+      responses:
+        '200': { $ref: '#/components/responses/Payable' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /payables/{payable_id}/retry:
+    parameters:
+      - $ref: '#/components/parameters/PayableId'
+    post:
+      tags: [Payables]
+      operationId: retryPayable
+      summary: Retry a failed payable
+      description: |
+        Tries a `failed` payable again, paying the individual's current default bank account.
+        Use it after the problem in `failure_reason` is fixed, such as a corrected bank account.
+      responses:
+        '200': { $ref: '#/components/responses/Payable' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---------------------------------------------------------------------------
+  # Contractor payments
+  # ---------------------------------------------------------------------------
+  /individuals/{individual_id}/payment_account:
+    parameters:
+      - $ref: '#/components/parameters/IndividualId'
+    get:
+      tags: [Payment Accounts]
+      operationId: getPaymentAccount
+      summary: Retrieve a payment account
+      responses:
+        '200': { $ref: '#/components/responses/PaymentAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Payment Accounts]
+      operationId: createPaymentAccount
+      summary: Create a payment account
+      description: |
+        Sets up a contractor to accept payments. Archipelago verifies the contractor's identity and business
+        details, treating them as a sole proprietor unless you send an EIN. The account starts in `pending`;
+        listen for `payment_account.updated` to know when it's `enabled`.
+
+        Fails with `409` if the individual isn't a contractor or already has a payment account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentAccountCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/PaymentAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /checkouts:
+    get:
+      tags: [Checkouts]
+      operationId: listCheckouts
+      summary: List checkouts
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - $ref: '#/components/parameters/ContractorIdQuery'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [created, attempted, completed, expired]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of checkouts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Checkouts]
+      operationId: createCheckout
+      summary: Create a checkout
+      description: |
+        Creates a checkout for a contractor. Share the returned `checkout_url` with the customer.
+        Fails with `409` if the contractor's payment account isn't `enabled`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Checkout' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /checkouts/{checkout_id}:
+    parameters:
+      - $ref: '#/components/parameters/CheckoutId'
+    get:
+      tags: [Checkouts]
+      operationId: getCheckout
+      summary: Retrieve a checkout
+      responses:
+        '200': { $ref: '#/components/responses/Checkout' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Checkouts]
+      operationId: updateCheckout
+      summary: Update a checkout
+      description: Updates the fields you send. Only checkouts in `created` can be changed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutFields' }
+      responses:
+        '200': { $ref: '#/components/responses/Checkout' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /payments:
+    get:
+      tags: [Payments]
+      operationId: listPayments
+      summary: List payments
+      parameters:
+        - $ref: '#/components/parameters/BusinessIdQuery'
+        - $ref: '#/components/parameters/ContractorIdQuery'
+        - name: checkout_id
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, succeeded, failed, disputed, partially_refunded, refunded]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of payments.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /payments/{payment_id}:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    get:
+      tags: [Payments]
+      operationId: getPayment
+      summary: Retrieve a payment
+      responses:
+        '200': { $ref: '#/components/responses/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /payments/{payment_id}/refunds:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    get:
+      tags: [Payments]
+      operationId: listRefunds
+      summary: List refunds of a payment
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/AfterCursor'
+        - $ref: '#/components/parameters/BeforeCursor'
+      responses:
+        '200':
+          description: A page of refunds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefundList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Payments]
+      operationId: createRefund
+      summary: Refund a payment
+      description: |
+        Refunds all or part of a `succeeded` payment. The refund is taken from the contractor's balance.
+        Fails with `409` if the amount is more than what's left to refund.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefundCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/Refund' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+webhooks:
+  payable.paid:
+    post:
+      tags: [Webhooks]
+      operationId: onPayablePaid
+      summary: payable.paid
+      description: A payable was paid out to the individual's bank account.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/EventBase'
+                - type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [payable.paid]
+                    data: { $ref: '#/components/schemas/Payable' }
+      responses:
+        '200':
+          description: Return any 2xx status to acknowledge the event.
+
+  payable.failed:
+    post:
+      tags: [Webhooks]
+      operationId: onPayableFailed
+      summary: payable.failed
+      description: A payable couldn't be paid. See `failure_reason`, fix the cause, then retry the payable.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/EventBase'
+                - type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [payable.failed]
+                    data: { $ref: '#/components/schemas/Payable' }
+      responses:
+        '200':
+          description: Return any 2xx status to acknowledge the event.
+
+  payment_account.updated:
+    post:
+      tags: [Webhooks]
+      operationId: onPaymentAccountUpdated
+      summary: payment_account.updated
+      description: A contractor's payment account changed status, for example from `under_review` to `enabled`.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/EventBase'
+                - type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [payment_account.updated]
+                    data: { $ref: '#/components/schemas/PaymentAccount' }
+      responses:
+        '200':
+          description: Return any 2xx status to acknowledge the event.
+
+  checkout.completed:
+    post:
+      tags: [Webhooks]
+      operationId: onCheckoutCompleted
+      summary: checkout.completed
+      description: A customer paid a checkout. The payment is in `payment_id`.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/EventBase'
+                - type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [checkout.completed]
+                    data: { $ref: '#/components/schemas/Checkout' }
+      responses:
+        '200':
+          description: Return any 2xx status to acknowledge the event.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from the OAuth 2.0 client-credentials flow.
+
+  parameters:
+    # Pagination
+    Limit:
+      name: limit
+      in: query
+      description: Maximum number of records to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    AfterCursor:
+      name: after_cursor
+      in: query
+      description: Return records after this cursor (`page_info.end_cursor` of the previous page).
+      schema:
+        type: string
+    BeforeCursor:
+      name: before_cursor
+      in: query
+      description: Return records before this cursor (`page_info.start_cursor` of the next page).
+      schema:
+        type: string
+
+    # Headers
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: A unique key, such as a UUID, that makes the request safe to retry.
+      schema:
+        type: string
+        maxLength: 255
+      example: 5f3c1f0e-8a4b-4f3e-9c1a-2b7d6e9a1c44
+    WebhookSignature:
+      name: Archipelago-Signature
+      in: header
+      required: true
+      description: Signature for verifying the event came from Archipelago. See [Webhooks](#section/Webhooks).
+      schema:
+        type: string
+      example: t=1790000000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+
+    # Filters
+    BusinessIdQuery:
+      name: business_id
+      in: query
+      description: Only return records of this business.
+      schema:
+        type: string
+    IndividualIdQuery:
+      name: individual_id
+      in: query
+      description: Only return records of this individual.
+      schema:
+        type: string
+    ContractorIdQuery:
+      name: contractor_id
+      in: query
+      description: Only return records of this contractor.
+      schema:
+        type: string
+    IncludeArchived:
+      name: include_archived
+      in: query
+      description: Include archived records.
+      schema:
+        type: boolean
+        default: false
+
+    # Path IDs
+    BusinessId:
+      name: business_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: bus_8fK2mQ4nX1
+    TeamId:
+      name: team_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: team_3Jd9sL0pQ2
+    IndividualId:
+      name: individual_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: ind_7Hq2vN5cR8
+    BankAccountId:
+      name: bank_account_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: bnk_6Tr3Yu8Io1
+    CompensationId:
+      name: compensation_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: cmp_4Df7Gh1Jk3
+    BonusId:
+      name: bonus_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: bns_5Gt2Hy6Uj9
+    ExpenseId:
+      name: expense_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: exp_4Lk8Mn2Bv5
+    ReimbursementId:
+      name: reimbursement_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: rmb_2Zx5Cv8Bn4
+    PayableId:
+      name: payable_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: pbl_7Ui4Op1As6
+    CheckoutId:
+      name: checkout_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: chk_3Er6Ty9Ui2
+    PaymentId:
+      name: payment_id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: pmt_8Yh5Tg2Rf7
+
+  responses:
+    # Errors
+    Unauthorized:
+      description: Missing or invalid access token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: unauthorized
+              message: The access token is missing, invalid or expired.
+    NotFound:
+      description: The resource doesn't exist or isn't visible to your API client.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: not_found
+              message: No such individual.
+    Conflict:
+      description: The action isn't allowed in the resource's current state.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: invalid_state
+              message: Only bonuses in pending_approval can be approved.
+    ValidationError:
+      description: The request body failed validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: validation_error
+              message: The request body is invalid.
+              details:
+                - field: email
+                  message: is not a valid email address
+
+    # Resources
+    Business:
+      description: A business.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Business' }
+    Team:
+      description: A team.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Team' }
+    TeamMember:
+      description: A team membership.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/TeamMember' }
+    Individual:
+      description: An individual.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Individual' }
+    BankAccount:
+      description: A bank account.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/BankAccount' }
+    Compensation:
+      description: A compensation record.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Compensation' }
+    Bonus:
+      description: A bonus.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Bonus' }
+    Expense:
+      description: An expense.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Expense' }
+    Reimbursement:
+      description: A reimbursement.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Reimbursement' }
+    Payable:
+      description: A payable.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Payable' }
+    PaymentAccount:
+      description: A contractor's payment account.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PaymentAccount' }
+    Checkout:
+      description: A checkout.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Checkout' }
+    Payment:
+      description: A payment.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Payment' }
+    Refund:
+      description: A refund.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Refund' }
+
+  schemas:
+    # -------------------------------------------------------------------------
+    # Shared
+    # -------------------------------------------------------------------------
+    Address:
+      type: object
+      required: [line1, city, state, postal_code, country]
+      properties:
+        line1:
+          type: string
+          example: 100 Harbor Way
+        line2:
+          type: string
+          example: Suite 400
+        city:
+          type: string
+          example: Portland
+        state:
+          type: string
+          description: State or province code.
+          example: OR
+        postal_code:
+          type: string
+          example: '97209'
+        country:
+          type: string
+          description: ISO 3166-1 alpha-2 country code.
+          default: US
+          example: US
+
+    Currency:
+      type: string
+      description: Lowercase ISO 4217 currency code.
+      enum: [usd, cad]
+      default: usd
+      example: usd
+
+    Metadata:
+      type: object
+      description: Up to 20 key-value pairs of your own data, such as an ID from another system.
+      maxProperties: 20
+      additionalProperties:
+        type: string
+        maxLength: 500
+      example:
+        hris_id: E-10442
+
+    PageInfo:
+      type: object
+      required: [has_previous, has_next, start_cursor, end_cursor]
+      properties:
+        has_previous:
+          type: boolean
+          example: false
+        has_next:
+          type: boolean
+          example: true
+        start_cursor:
+          type: string
+          example: eyJpZCI6ImJ1c184ZksybVE0blgxIn0
+        end_cursor:
+          type: string
+          example: eyJpZCI6ImJ1c18zUnQ3dlk5d0syIn0
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code.
+              example: validation_error
+            message:
+              type: string
+              description: Human-readable explanation.
+              example: The request body is invalid.
+            details:
+              type: array
+              description: Field-level problems. Only present on validation errors.
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                    example: email
+                  message:
+                    type: string
+                    example: is not a valid email address
+
+    # -------------------------------------------------------------------------
+    # Businesses
+    # -------------------------------------------------------------------------
+    BusinessFields:
+      type: object
+      properties:
+        legal_name:
+          type: string
+          description: Registered legal name.
+          example: Northwind Studio LLC
+        doing_business_as:
+          type: string
+          description: The name the business operates under, if different.
+          example: Northwind
+        business_structure:
+          type: string
+          enum: [sole_proprietorship, partnership, llc, corporation, non_profit]
+          example: llc
+        tax_id:
+          type: string
+          writeOnly: true
+          description: Employer Identification Number (EIN). Write-only; responses include `tax_id_last4`.
+          example: 12-3456789
+        email:
+          type: string
+          format: email
+          example: people@northwind.example
+        phone:
+          type: string
+          description: E.164 format.
+          example: '+15035550142'
+        website_url:
+          type: string
+          format: uri
+          example: https://northwind.example
+        address:
+          $ref: '#/components/schemas/Address'
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+
+    BusinessCreate:
+      allOf:
+        - $ref: '#/components/schemas/BusinessFields'
+        - required: [legal_name, business_structure, tax_id, email, address]
+
+    Business:
+      allOf:
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/BusinessFields'
+        - type: object
+          required: [created_at, updated_at]
+          properties:
+            tax_id_last4:
+              type: string
+              example: '6789'
+            archived_at:
+              type: [string, 'null']
+              format: date-time
+              example: null
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-01T14:30:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-09-01T14:30:00Z'
+
+    BusinessList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Business' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Teams
+    # -------------------------------------------------------------------------
+    TeamFields:
+      type: object
+      properties:
+        name:
+          type: string
+          example: Platform Engineering
+        description:
+          type: string
+          example: Builds and runs the core platform.
+        parent_team_id:
+          type: [string, 'null']
+          description: Makes this a sub-team of another team in the same business.
+          example: team_1Ab2Cd3Ef4
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+
+    TeamCreate:
+      allOf:
+        - type: object
+          required: [business_id, name]
+          properties:
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/TeamFields'
+
+    Team:
+      allOf:
+        - type: object
+          required: [id, business_id]
+          properties:
+            id:
+              type: string
+              example: team_3Jd9sL0pQ2
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/TeamFields'
+        - type: object
+          required: [member_count, created_at, updated_at]
+          properties:
+            member_count:
+              type: integer
+              example: 8
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-02T09:00:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-09-02T09:00:00Z'
+
+    TeamList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Team' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    TeamMemberCreate:
+      type: object
+      required: [individual_id]
+      properties:
+        individual_id:
+          type: string
+          description: Must belong to the team's business.
+          example: ind_7Hq2vN5cR8
+        role:
+          type: string
+          enum: [member, lead]
+          default: member
+          example: member
+
+    TeamMember:
+      type: object
+      required: [team_id, role, individual, joined_at]
+      properties:
+        team_id:
+          type: string
+          example: team_3Jd9sL0pQ2
+        role:
+          type: string
+          enum: [member, lead]
+          example: member
+        individual:
+          $ref: '#/components/schemas/IndividualSummary'
+        joined_at:
+          type: string
+          format: date-time
+          example: '2026-09-02T09:15:00Z'
+
+    TeamMemberList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/TeamMember' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Individuals
+    # -------------------------------------------------------------------------
+    IndividualFields:
+      type: object
+      properties:
+        first_name:
+          type: string
+          example: Maya
+        last_name:
+          type: string
+          example: Chen
+        email:
+          type: string
+          format: email
+          description: Work email. Unique within the business.
+          example: maya.chen@northwind.example
+        phone:
+          type: string
+          description: E.164 format.
+          example: '+15035550199'
+        date_of_birth:
+          type: string
+          format: date
+          example: '1990-04-18'
+        tax_id:
+          type: string
+          writeOnly: true
+          description: |
+            SSN or ITIN. Required before the individual can be paid. Write-only; responses include `tax_id_last4`.
+          example: 123-45-6789
+        address:
+          $ref: '#/components/schemas/Address'
+        job_title:
+          type: string
+          example: Senior Product Designer
+        employment_type:
+          type: string
+          enum: [full_time, part_time, contractor]
+          description: Contractors can also accept payments from their own customers through a payment account.
+          example: full_time
+        status:
+          type: string
+          enum: [onboarding, active, on_leave, terminated]
+          default: onboarding
+          example: active
+        manager_id:
+          type: [string, 'null']
+          description: The individual this person reports to.
+          example: ind_2Mn4Bv6Cx8
+        start_date:
+          type: string
+          format: date
+          example: '2026-09-15'
+        end_date:
+          type: [string, 'null']
+          format: date
+          description: Last working day. Set it when `status` is `terminated`.
+          example: null
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+
+    IndividualCreate:
+      allOf:
+        - type: object
+          required: [business_id, first_name, last_name, email, employment_type, start_date]
+          properties:
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/IndividualFields'
+
+    Individual:
+      allOf:
+        - type: object
+          required: [id, business_id]
+          properties:
+            id:
+              type: string
+              example: ind_7Hq2vN5cR8
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/IndividualFields'
+        - type: object
+          required: [team_ids, created_at, updated_at]
+          properties:
+            tax_id_last4:
+              type: string
+              example: '6789'
+            team_ids:
+              type: array
+              items:
+                type: string
+              example: [team_3Jd9sL0pQ2]
+            archived_at:
+              type: [string, 'null']
+              format: date-time
+              example: null
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-03T16:20:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-09-03T16:20:00Z'
+
+    IndividualSummary:
+      type: object
+      required: [id, first_name, last_name, email]
+      properties:
+        id:
+          type: string
+          example: ind_7Hq2vN5cR8
+        first_name:
+          type: string
+          example: Maya
+        last_name:
+          type: string
+          example: Chen
+        email:
+          type: string
+          format: email
+          example: maya.chen@northwind.example
+        job_title:
+          type: string
+          example: Senior Product Designer
+
+    IndividualList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Individual' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Bank accounts
+    # -------------------------------------------------------------------------
+    BankAccountCreate:
+      type: object
+      required: [owner_type, owner_id, account_owner_name, account_type, routing_number, account_number]
+      properties:
+        owner_type:
+          type: string
+          enum: [business, individual]
+          description: Business accounts fund payables. Individual accounts receive them.
+          example: individual
+        owner_id:
+          type: string
+          description: ID of the business or individual that owns the account.
+          example: ind_7Hq2vN5cR8
+        account_owner_name:
+          type: string
+          description: Name on the bank account.
+          example: Maya Chen
+        account_type:
+          type: string
+          enum: [checking, savings]
+          example: checking
+        routing_number:
+          type: string
+          writeOnly: true
+          example: '110000000'
+        account_number:
+          type: string
+          writeOnly: true
+          example: '000123456789'
+        is_default:
+          type: boolean
+          default: true
+          description: Use this account for the owner's payouts (or funding, for a business), replacing the current default.
+          example: true
+
+    BankAccount:
+      allOf:
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              example: bnk_6Tr3Yu8Io1
+        - $ref: '#/components/schemas/BankAccountCreate'
+        - type: object
+          required: [account_number_last4, status, created_at]
+          properties:
+            account_number_last4:
+              type: string
+              example: '6789'
+            bank_name:
+              type: string
+              example: First Pacific Bank
+            status:
+              type: string
+              enum: [pending_verification, verified, errored]
+              example: verified
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-03T16:25:00Z'
+
+    BankAccountList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/BankAccount' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Compensation
+    # -------------------------------------------------------------------------
+    CompensationFields:
+      type: object
+      properties:
+        pay_type:
+          type: string
+          enum: [salary, hourly, fixed]
+          description: |
+            How `amount` is read:
+            - `salary`: the yearly salary, split evenly across pay periods.
+            - `hourly`: the hourly rate, paid for `hours_per_period` hours each period.
+            - `fixed`: paid as-is every period, such as a contractor retainer.
+          example: salary
+        amount:
+          type: integer
+          minimum: 1
+          description: In the currency's minor unit. Its meaning depends on `pay_type`.
+          example: 12000000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        pay_frequency:
+          type: string
+          enum: [weekly, biweekly, semimonthly, monthly]
+          example: biweekly
+        hours_per_period:
+          type: integer
+          minimum: 1
+          description: Hours paid each period. Required when `pay_type` is `hourly`.
+          example: 80
+        effective_date:
+          type: string
+          format: date
+          description: First day this compensation applies.
+          example: '2026-10-01'
+        end_date:
+          type: [string, 'null']
+          format: date
+          description: Last day this compensation applies. Leave empty for no end date.
+          example: null
+
+    CompensationCreate:
+      allOf:
+        - type: object
+          required: [individual_id, pay_type, amount, pay_frequency, effective_date]
+          properties:
+            individual_id:
+              type: string
+              example: ind_7Hq2vN5cR8
+        - $ref: '#/components/schemas/CompensationFields'
+
+    Compensation:
+      allOf:
+        - type: object
+          required: [id, individual_id, business_id]
+          properties:
+            id:
+              type: string
+              example: cmp_4Df7Gh1Jk3
+            individual_id:
+              type: string
+              example: ind_7Hq2vN5cR8
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/CompensationFields'
+        - type: object
+          required: [status, created_at, updated_at]
+          properties:
+            status:
+              type: string
+              enum: [scheduled, active, ended]
+              description: |
+                - `scheduled`: `effective_date` is in the future.
+                - `active`: payables are being created for each pay period.
+                - `ended`: past its `end_date`.
+              example: active
+            next_pay_date:
+              type: [string, 'null']
+              format: date
+              example: '2026-10-16'
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-03T16:30:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-09-03T16:30:00Z'
+
+    CompensationList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Compensation' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Bonuses
+    # -------------------------------------------------------------------------
+    BonusCreate:
+      type: object
+      required: [individual_id, type, amount]
+      properties:
+        individual_id:
+          type: string
+          example: ind_7Hq2vN5cR8
+        type:
+          type: string
+          enum: [signing, performance, referral, retention, spot, other]
+          example: performance
+        amount:
+          type: integer
+          minimum: 1
+          description: In the currency's minor unit.
+          example: 250000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        reason:
+          type: string
+          example: Shipped the design system migration ahead of schedule.
+        pay_date:
+          type: string
+          format: date
+          description: When to pay the bonus. Defaults to the individual's next pay date.
+          example: '2026-10-16'
+
+    Bonus:
+      allOf:
+        - type: object
+          required: [id, business_id]
+          properties:
+            id:
+              type: string
+              example: bns_5Gt2Hy6Uj9
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/BonusCreate'
+        - type: object
+          required: [status, created_at, updated_at]
+          properties:
+            status:
+              type: string
+              enum: [pending_approval, approved, paid, canceled]
+              example: approved
+            approved_at:
+              type: [string, 'null']
+              format: date-time
+              example: '2026-10-02T10:00:00Z'
+            payable_id:
+              type: [string, 'null']
+              description: The payable created when the bonus was approved.
+              example: pbl_7Ui4Op1As6
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-10-01T18:45:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-10-02T10:00:00Z'
+
+    BonusList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Bonus' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Expenses
+    # -------------------------------------------------------------------------
+    ExpenseFields:
+      type: object
+      properties:
+        category:
+          type: string
+          enum: [travel, lodging, meals, equipment, software, training, other]
+          example: travel
+        amount:
+          type: integer
+          minimum: 1
+          description: In the currency's minor unit.
+          example: 48250
+        currency:
+          $ref: '#/components/schemas/Currency'
+        merchant:
+          type: string
+          example: Alaska Airlines
+        incurred_on:
+          type: string
+          format: date
+          example: '2026-09-12'
+        description:
+          type: string
+          example: Flight to Denver for the customer workshop.
+        receipt_url:
+          type: string
+          format: uri
+          example: https://files.archipelago.example/receipts/exp_4Lk8Mn2Bv5.pdf
+
+    ExpenseCreate:
+      allOf:
+        - type: object
+          required: [individual_id, category, amount, incurred_on]
+          properties:
+            individual_id:
+              type: string
+              example: ind_7Hq2vN5cR8
+        - $ref: '#/components/schemas/ExpenseFields'
+
+    Expense:
+      allOf:
+        - type: object
+          required: [id, individual_id, business_id]
+          properties:
+            id:
+              type: string
+              example: exp_4Lk8Mn2Bv5
+            individual_id:
+              type: string
+              example: ind_7Hq2vN5cR8
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/ExpenseFields'
+        - type: object
+          required: [status, created_at, updated_at]
+          properties:
+            status:
+              type: string
+              enum: [submitted, approved, rejected, reimbursed]
+              example: approved
+            reviewed_at:
+              type: [string, 'null']
+              format: date-time
+              example: '2026-09-14T11:00:00Z'
+            rejection_reason:
+              type: [string, 'null']
+              example: null
+            reimbursement_id:
+              type: [string, 'null']
+              example: null
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-13T08:10:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-09-14T11:00:00Z'
+
+    ExpenseRejection:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          example: Please attach an itemized receipt.
+
+    ExpenseList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Expense' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Reimbursements
+    # -------------------------------------------------------------------------
+    ReimbursementCreate:
+      type: object
+      required: [individual_id, expense_ids]
+      properties:
+        individual_id:
+          type: string
+          example: ind_7Hq2vN5cR8
+        expense_ids:
+          type: array
+          minItems: 1
+          description: Approved, not yet reimbursed expenses of this individual, all in the same currency.
+          items:
+            type: string
+          example: [exp_4Lk8Mn2Bv5, exp_9Qa3Ws7Ed1]
+        pay_date:
+          type: string
+          format: date
+          description: When to pay the reimbursement. Defaults to the next business day.
+          example: '2026-09-16'
+
+    Reimbursement:
+      allOf:
+        - type: object
+          required: [id, business_id]
+          properties:
+            id:
+              type: string
+              example: rmb_2Zx5Cv8Bn4
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/ReimbursementCreate'
+        - type: object
+          required: [amount, currency, status, payable_id, created_at, updated_at]
+          properties:
+            amount:
+              type: integer
+              description: Total of the expenses, in the currency's minor unit.
+              example: 56700
+            currency:
+              $ref: '#/components/schemas/Currency'
+            status:
+              type: string
+              enum: [scheduled, processing, paid, failed, canceled]
+              description: Follows the status of its payable.
+              example: scheduled
+            payable_id:
+              type: string
+              example: pbl_1Df5Gh8Jk2
+            paid_at:
+              type: [string, 'null']
+              format: date-time
+              example: null
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-15T09:00:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-09-15T09:00:00Z'
+
+    ReimbursementList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Reimbursement' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Payables
+    # -------------------------------------------------------------------------
+    Payable:
+      type: object
+      required: [id, business_id, individual_id, source_type, source_id, amount, currency, pay_date, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          example: pbl_7Ui4Op1As6
+        business_id:
+          type: string
+          example: bus_8fK2mQ4nX1
+        individual_id:
+          type: string
+          example: ind_7Hq2vN5cR8
+        source_type:
+          type: string
+          enum: [compensation, bonus, reimbursement]
+          description: What the payable is for.
+          example: compensation
+        source_id:
+          type: string
+          description: ID of the compensation, bonus or reimbursement.
+          example: cmp_4Df7Gh1Jk3
+        amount:
+          type: integer
+          description: In the currency's minor unit.
+          example: 461538
+        currency:
+          $ref: '#/components/schemas/Currency'
+        pay_date:
+          type: string
+          format: date
+          example: '2026-10-16'
+        period_start:
+          type: [string, 'null']
+          format: date
+          description: Start of the pay period covered. Compensation payables only.
+          example: '2026-10-01'
+        period_end:
+          type: [string, 'null']
+          format: date
+          description: End of the pay period covered. Compensation payables only.
+          example: '2026-10-14'
+        bank_account_id:
+          type: [string, 'null']
+          description: The individual's bank account the payable was sent to. Set when processing starts.
+          example: null
+        status:
+          type: string
+          enum: [scheduled, processing, paid, failed, canceled]
+          description: |
+            - `scheduled`: waiting for `pay_date`.
+            - `processing`: the payout is on its way to the bank.
+            - `paid`: the funds reached the individual's bank account.
+            - `failed`: see `failure_reason`. Can be retried.
+            - `canceled`: won't be paid.
+          example: scheduled
+        failure_reason:
+          type: [string, 'null']
+          description: Why the payout failed, such as `invalid_bank_account` or `insufficient_funding`.
+          example: null
+        paid_at:
+          type: [string, 'null']
+          format: date-time
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-10-01T00:00:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-10-01T00:00:00Z'
+
+    PayableList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Payable' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Payment accounts
+    # -------------------------------------------------------------------------
+    PaymentAccountCreate:
+      type: object
+      required: [bank_account_id, terms_acceptance]
+      properties:
+        business_name:
+          type: string
+          description: Name customers see on checkouts and statements. Defaults to the contractor's full name.
+          example: Maya Chen Design
+        tax_id:
+          type: string
+          writeOnly: true
+          description: The contractor's EIN, if they have one. Defaults to their SSN or ITIN as a sole proprietor.
+          example: 98-7654321
+        bank_account_id:
+          type: string
+          description: A bank account owned by the contractor, where their customers' payments settle.
+          example: bnk_6Tr3Yu8Io1
+        terms_acceptance:
+          type: object
+          required: [ip_address, accepted_at]
+          description: When and where the contractor accepted the Archipelago payment terms in your app.
+          properties:
+            ip_address:
+              type: string
+              example: 203.0.113.24
+            user_agent:
+              type: string
+              example: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15
+            accepted_at:
+              type: string
+              format: date-time
+              example: '2026-09-20T17:04:00Z'
+
+    PaymentAccount:
+      type: object
+      required: [individual_id, business_name, bank_account_id, status, created_at, updated_at]
+      properties:
+        individual_id:
+          type: string
+          example: ind_7Hq2vN5cR8
+        business_name:
+          type: string
+          example: Maya Chen Design
+        bank_account_id:
+          type: string
+          example: bnk_6Tr3Yu8Io1
+        status:
+          type: string
+          enum: [pending, under_review, enabled, rejected, disabled]
+          description: |
+            - `pending`: submitted for verification.
+            - `under_review`: the contractor's details are being reviewed.
+            - `enabled`: the contractor can accept payments.
+            - `rejected`: verification failed.
+            - `disabled`: turned off by the business or by Archipelago.
+          example: enabled
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-20T17:05:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-09-21T09:30:00Z'
+
+    # -------------------------------------------------------------------------
+    # Checkouts
+    # -------------------------------------------------------------------------
+    CheckoutFields:
+      type: object
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: Amount to charge the customer, in the currency's minor unit.
+          example: 450000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        platform_fee_amount:
+          type: integer
+          minimum: 0
+          description: Part of the amount kept by the business. Defaults to the business's configured fee.
+          example: 13500
+        description:
+          type: string
+          description: Shown to the customer on the checkout page.
+          example: Brand identity package, final invoice
+        customer:
+          $ref: '#/components/schemas/Customer'
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+
+    CheckoutCreate:
+      allOf:
+        - type: object
+          required: [contractor_id, amount, description]
+          properties:
+            contractor_id:
+              type: string
+              description: The contractor being paid. Their payment account must be `enabled`.
+              example: ind_7Hq2vN5cR8
+        - $ref: '#/components/schemas/CheckoutFields'
+
+    Checkout:
+      allOf:
+        - type: object
+          required: [id, contractor_id, business_id]
+          properties:
+            id:
+              type: string
+              example: chk_3Er6Ty9Ui2
+            contractor_id:
+              type: string
+              example: ind_7Hq2vN5cR8
+            business_id:
+              type: string
+              example: bus_8fK2mQ4nX1
+        - $ref: '#/components/schemas/CheckoutFields'
+        - type: object
+          required: [status, checkout_url, expires_at, created_at, updated_at]
+          properties:
+            status:
+              type: string
+              enum: [created, attempted, completed, expired]
+              description: |
+                - `created`: waiting for the customer.
+                - `attempted`: a payment attempt failed; the customer can try again.
+                - `completed`: paid. See `payment_id`.
+                - `expired`: not paid before `expires_at`.
+              example: created
+            checkout_url:
+              type: string
+              format: uri
+              description: Hosted checkout page to share with the customer.
+              example: https://pay.archipelago.example/c/chk_3Er6Ty9Ui2
+            expires_at:
+              type: string
+              format: date-time
+              example: '2026-09-30T12:00:00Z'
+            payment_id:
+              type: [string, 'null']
+              example: null
+            completed_at:
+              type: [string, 'null']
+              format: date-time
+              example: null
+            created_at:
+              type: string
+              format: date-time
+              example: '2026-09-23T12:00:00Z'
+            updated_at:
+              type: string
+              format: date-time
+              example: '2026-09-23T12:00:00Z'
+
+    Customer:
+      type: object
+      properties:
+        name:
+          type: string
+          example: Contoso Coffee
+        email:
+          type: string
+          format: email
+          description: Where the receipt is sent.
+          example: billing@contoso.example
+
+    CheckoutList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Checkout' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Payments and refunds
+    # -------------------------------------------------------------------------
+    Payment:
+      type: object
+      required: [id, business_id, contractor_id, amount, amount_refunded, currency, status, payment_method, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          example: pmt_8Yh5Tg2Rf7
+        business_id:
+          type: string
+          example: bus_8fK2mQ4nX1
+        contractor_id:
+          type: string
+          example: ind_7Hq2vN5cR8
+        checkout_id:
+          type: [string, 'null']
+          example: chk_3Er6Ty9Ui2
+        amount:
+          type: integer
+          description: In the currency's minor unit.
+          example: 450000
+        amount_refunded:
+          type: integer
+          example: 0
+        platform_fee_amount:
+          type: integer
+          example: 13500
+        currency:
+          $ref: '#/components/schemas/Currency'
+        status:
+          type: string
+          enum: [pending, succeeded, failed, disputed, partially_refunded, refunded]
+          description: Bank account payments stay `pending` for a few business days before they succeed.
+          example: succeeded
+        description:
+          type: string
+          example: Brand identity package, final invoice
+        customer:
+          $ref: '#/components/schemas/Customer'
+        payment_method:
+          type: object
+          required: [type, last4]
+          properties:
+            type:
+              type: string
+              enum: [card, bank_account]
+              example: card
+            brand:
+              type: string
+              description: Card payments only.
+              example: visa
+            last4:
+              type: string
+              example: '4242'
+        failure_reason:
+          type: [string, 'null']
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-24T15:10:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-09-24T15:10:00Z'
+
+    PaymentList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Payment' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    RefundCreate:
+      type: object
+      required: [reason]
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: Amount to refund, in the currency's minor unit. Defaults to everything not yet refunded.
+          example: 50000
+        reason:
+          type: string
+          enum: [duplicate, fraudulent, customer_request]
+          example: customer_request
+        description:
+          type: string
+          example: Partial refund for a cancelled revision round.
+
+    Refund:
+      type: object
+      required: [id, payment_id, amount, reason, status, created_at]
+      properties:
+        id:
+          type: string
+          example: rfd_1Qw4Er7Ty0
+        payment_id:
+          type: string
+          example: pmt_8Yh5Tg2Rf7
+        amount:
+          type: integer
+          example: 50000
+        reason:
+          type: string
+          enum: [duplicate, fraudulent, customer_request]
+          example: customer_request
+        description:
+          type: string
+          example: Partial refund for a cancelled revision round.
+        status:
+          type: string
+          enum: [pending, succeeded, failed]
+          example: succeeded
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-25T10:00:00Z'
+
+    RefundList:
+      type: object
+      required: [data, page_info]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Refund' }
+        page_info: { $ref: '#/components/schemas/PageInfo' }
+
+    # -------------------------------------------------------------------------
+    # Events
+    # -------------------------------------------------------------------------
+    EventBase:
+      type: object
+      required: [id, type, created_at, data]
+      properties:
+        id:
+          type: string
+          example: evt_6Sd9Fg3Hj5
+        type:
+          type: string
+          description: The event type.
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-10-16T14:02:00Z'
